@@ -8,293 +8,451 @@ Analyzes all Kenya-specific CSV files in this repo to document:
 4. How Kenya CSVs are derived from parent files
 5. Automated extraction utility
 
-Run: python3 explore_vdem_data.py
+Usage:
+  python3 explore_vdem_data.py                          # Run full analysis
+  python3 explore_vdem_data.py --derive <parent.csv>    # Extract Kenya from parent
 """
 
-import csv
+from __future__ import annotations
+
+import logging
 import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
-BASE = Path(__file__).resolve().parent
+import numpy as np
+import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-# ── Discover all Kenya CSV files ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-def discover_kenya_csvs() -> list[dict]:
-    """Find all Kenya-filtered V-Dem CSVs and extract metadata."""
-    results = []
-    for f in sorted(BASE.iterdir()):
-        if not f.suffix == ".csv":
-            continue
-        name = f.name.lower()
-        if "kenya" not in name:
-            continue
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-        # Determine series
-        if "ds-cy" in name:
-            series = "DS-CY"
-        elif "cy-core" in name:
-            series = "CY-Core"
-        else:
-            series = "Unknown"
+KENYA_VDEM_ID: str = "KEN"
 
-        # Extract version
-        m = re.search(r"v([\d.]+)", f.name, re.IGNORECASE)
-        version = m.group(1) if m else "?"
+BASE_DIR = Path(os.environ.get("VDEM_DATA_DIR", Path(__file__).resolve().parent))
 
-        with open(f) as fh:
-            reader = csv.DictReader(fh)
-            cols = reader.fieldnames or []
-            rows = list(reader)
+# ---------------------------------------------------------------------------
+# Indicator definitions — mirrored from V-DEM.py for cross-reference
+# (vdem_source_col, db_col, low_col, high_col)
+# ---------------------------------------------------------------------------
 
-        years = sorted(int(r["year"]) for r in rows if r.get("year", "").strip())
-        country_ids = set(r.get("country_text_id", "") for r in rows if r.get("country_text_id", "").strip())
-
-        results.append({
-            "file": f.name,
-            "series": series,
-            "version": version,
-            "num_cols": len(cols),
-            "num_rows": len(rows),
-            "year_min": years[0] if years else None,
-            "year_max": years[-1] if years else None,
-            "num_years": len(years),
-            "country_ids": country_ids,
-            "columns": set(cols),
-        })
-    return results
-
-
-def discover_parent_csvs() -> list[dict]:
-    """Find parent (non-Kenya) V-Dem CSVs."""
-    results = []
-    for f in sorted(BASE.iterdir()):
-        if not f.suffix == ".csv":
-            continue
-        name = f.name.lower()
-        if "kenya" in name:
-            continue
-        size = f.stat().st_size
-        m = re.search(r"v([\d.]+)", f.name, re.IGNORECASE)
-        version = m.group(1) if m else "?"
-        results.append({
-            "file": f.name,
-            "version": version,
-            "size_bytes": size,
-            "empty": size == 0,
-        })
-    return results
-
-
-# ── ETL indicator columns used by V-DEM.py ────────────────────────────────────
-
-ETL_INDICATORS = [
-    "v2x_polyarchy", "v2x_libdem", "v2x_partipdem", "v2x_delibdem",
-    "v2x_egaldem", "v2xel_frefair", "v2x_jucon", "v2x_legcon",
-    "v2x_corr", "v2x_pubcorr", "v2x_execorr", "v2xcs_ccsi",
-    "v2x_freexp_altinf",
+VDEM_INDICATORS: list[tuple[str, str, str, str]] = [
+    ("v2x_polyarchy",       "polyarchy",                "v2x_polyarchy_codelow",        "v2x_polyarchy_codehigh"),
+    ("v2x_libdem",          "libdem",                   "v2x_libdem_codelow",           "v2x_libdem_codehigh"),
+    ("v2x_partipdem",       "partipdem",                "v2x_partipdem_codelow",        "v2x_partipdem_codehigh"),
+    ("v2x_delibdem",        "delibdem",                 "v2x_delibdem_codelow",         "v2x_delibdem_codehigh"),
+    ("v2x_egaldem",         "egaldem",                  "v2x_egaldem_codelow",          "v2x_egaldem_codehigh"),
+    ("v2xel_frefair",       "elections_free_fair",      "v2xel_frefair_codelow",        "v2xel_frefair_codehigh"),
+    ("v2x_jucon",           "judicial_constraints",     "v2x_jucon_codelow",            "v2x_jucon_codehigh"),
+    ("v2x_legcon",          "legislative_constraints",  "v2x_legcon_codelow",           "v2x_legcon_codehigh"),
+    ("v2x_corr",            "corruption_index",         "v2x_corr_codelow",             "v2x_corr_codehigh"),
+    ("v2x_pubcorr",         "public_corruption",        "v2x_pubcorr_codelow",          "v2x_pubcorr_codehigh"),
+    ("v2x_execorr",         "exec_corruption",          "v2x_execorr_codelow",          "v2x_execorr_codehigh"),
+    ("v2xcs_ccsi",          "civil_society",            "v2xcs_ccsi_codelow",           "v2xcs_ccsi_codehigh"),
+    ("v2x_freexp_altinf",   "freedom_expression",       "v2x_freexp_altinf_codelow",    "v2x_freexp_altinf_codehigh"),
 ]
 
-# The ETL script references v2x_legcon, but V-Dem actually uses v2xlg_legcon.
-# v2x_freexp_altinf exists only in CY-Core (v8+), not in DS-CY (v5-v7.1).
-ETL_INDICATOR_NOTES = {
-    "v2x_legcon": "NOT present in any file. Actual V-Dem column is 'v2xlg_legcon'. "
-                  "The ETL handles this gracefully (stores NULL).",
-    "v2x_freexp_altinf": "Present in CY-Core v8-v16 only. "
-                         "DS-CY series (v5-v7.1) uses 'v2x_freexp' and 'v2x_freexp_thick' instead.",
+_ETL_SOURCE_COLS: list[str] = [t[0] for t in VDEM_INDICATORS]
+
+ETL_INDICATOR_NOTES: dict[str, str] = {
+    "v2x_legcon": (
+        "NOT present in any file. Actual V-Dem column is 'v2xlg_legcon'. "
+        "The ETL handles this gracefully (stores NULL)."
+    ),
+    "v2x_freexp_altinf": (
+        "Present in CY-Core v8-v16 only. "
+        "DS-CY series (v5-v7.1) uses 'v2x_freexp' and 'v2x_freexp_thick' instead."
+    ),
 }
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-# ── Automated Kenya extraction from parent ────────────────────────────────────
+def _extract_version(filename: str) -> str:
+    """Extract version string from filename (e.g. 'Core-v14 Kenya.csv' → '14')."""
+    m = re.search(r"v([\d.]+)", filename, re.IGNORECASE)
+    return m.group(1) if m else "?"
 
-def extract_kenya_from_parent(parent_csv: Path, output_csv: Path,
-                              country_code: str = "KEN") -> int:
+
+def _detect_series(filename: str) -> str:
+    """Classify a V-Dem CSV into its release series."""
+    name = filename.lower()
+    if "ds-cy" in name:
+        return "DS-CY"
+    if "cy-core" in name:
+        return "CY-Core"
+    return "Unknown"
+
+# ---------------------------------------------------------------------------
+# Discover — scan directory for V-Dem CSVs
+# ---------------------------------------------------------------------------
+
+def discover_kenya_csvs(base: Path) -> list[dict[str, Any]]:
+    """Find all Kenya-filtered V-Dem CSVs and extract metadata via pandas."""
+    results: list[dict[str, Any]] = []
+
+    for f in sorted(base.iterdir()):
+        if f.suffix != ".csv" or "kenya" not in f.name.lower():
+            continue
+
+        log.info("Scanning Kenya file: %s", f.name)
+
+        try:
+            df = pd.read_csv(f, low_memory=False)
+        except Exception as exc:
+            log.warning("Failed to read %s: %s", f.name, exc)
+            continue
+
+        if "year" not in df.columns:
+            log.warning("No 'year' column in %s — skipping.", f.name)
+            continue
+
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        valid_years = df["year"].dropna().astype(int)
+
+        country_ids: set[str] = set()
+        if "country_text_id" in df.columns:
+            country_ids = set(
+                df["country_text_id"].dropna().str.strip().str.upper().unique()
+            )
+
+        results.append({
+            "file":        f.name,
+            "series":      _detect_series(f.name),
+            "version":     _extract_version(f.name),
+            "num_cols":    len(df.columns),
+            "num_rows":    len(df),
+            "year_min":    int(valid_years.min()) if len(valid_years) else None,
+            "year_max":    int(valid_years.max()) if len(valid_years) else None,
+            "num_years":   len(valid_years),
+            "country_ids": country_ids,
+            "columns":     set(df.columns),
+        })
+
+    log.info("Discovered %d Kenya CSV files.", len(results))
+    return results
+
+
+def discover_parent_csvs(base: Path) -> list[dict[str, Any]]:
+    """Find parent (non-Kenya) V-Dem CSVs."""
+    results: list[dict[str, Any]] = []
+
+    for f in sorted(base.iterdir()):
+        if f.suffix != ".csv" or "kenya" in f.name.lower():
+            continue
+
+        size = f.stat().st_size
+        results.append({
+            "file":       f.name,
+            "version":    _extract_version(f.name),
+            "size_bytes": size,
+            "empty":      size == 0,
+        })
+
+    log.info("Discovered %d parent CSV files.", len(results))
+    return results
+
+# ---------------------------------------------------------------------------
+# Extract — derive Kenya CSV from a full V-Dem parent file
+# ---------------------------------------------------------------------------
+
+def extract_kenya_from_parent(
+    parent_csv: Path,
+    output_csv: Path,
+    country_code: str = KENYA_VDEM_ID,
+) -> int:
     """
     Derive a Kenya-specific CSV from a full V-Dem parent CSV.
 
     Strategy (matches how the existing Kenya CSVs were created):
-    1. Read the parent CSV
-    2. Filter rows where country_text_id == 'KEN' (case-insensitive)
-    3. Write all columns to the output CSV
+    1. Load the full V-Dem CSV (all countries, all years)
+    2. Filter rows where country_text_id == country_code (case-insensitive)
+    3. Write all columns unchanged to the output CSV
 
     Returns the number of Kenya rows written.
     """
     if not parent_csv.exists():
-        raise FileNotFoundError(f"Parent CSV not found: {parent_csv}")
+        log.error("Parent CSV not found: %s", parent_csv)
+        sys.exit(1)
 
-    with open(parent_csv, newline="") as fin:
-        reader = csv.DictReader(fin)
-        fieldnames = reader.fieldnames
-        if not fieldnames:
-            raise ValueError(f"No header found in {parent_csv}")
+    log.info("Loading parent V-Dem file: %s  (may take a moment for large CSV)", parent_csv)
 
-        # Identify the country column (country_text_id in all versions)
-        if "country_text_id" not in fieldnames:
-            raise ValueError(f"'country_text_id' column not found in {parent_csv}")
+    try:
+        header_df = pd.read_csv(parent_csv, nrows=0)
+        available = set(header_df.columns)
+    except Exception as exc:
+        log.error("Failed to read header from %s: %s", parent_csv, exc)
+        sys.exit(1)
 
-        kenya_rows = []
-        for row in reader:
-            if row.get("country_text_id", "").strip().upper() == country_code:
-                kenya_rows.append(row)
+    if "country_text_id" not in available:
+        log.error("'country_text_id' column not found in %s.", parent_csv)
+        sys.exit(1)
 
-    if not kenya_rows:
-        print(f"  WARNING: No rows found for {country_code} in {parent_csv.name}")
-        return 0
+    try:
+        df = pd.read_csv(parent_csv, low_memory=False)
+    except Exception as exc:
+        log.error("Failed to load %s: %s", parent_csv, exc)
+        sys.exit(1)
 
-    with open(output_csv, "w", newline="") as fout:
-        writer = csv.DictWriter(fout, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(kenya_rows)
+    kenya = df[df["country_text_id"].str.upper().eq(country_code)].copy()
 
-    return len(kenya_rows)
+    if kenya.empty:
+        log.error(
+            "No rows with country_text_id='%s' in %s.", country_code, parent_csv.name
+        )
+        sys.exit(1)
 
+    kenya.to_csv(output_csv, index=False)
 
-def auto_derive_kenya_csv(parent_path: str) -> None:
-    """Given a parent V-Dem CSV path, auto-generate the Kenya derivative."""
-    parent = Path(parent_path)
-    # Determine output name: insert " Kenya" before .csv
-    stem = parent.stem  # e.g. "V-Dem-CY-Core-v10"
-    output = parent.parent / f"{stem} Kenya.csv"
+    log.info(
+        "Wrote %d Kenya rows (%d columns) to %s.",
+        len(kenya), len(kenya.columns), output_csv.name,
+    )
+    return len(kenya)
 
-    print(f"\nExtracting Kenya data from: {parent.name}")
-    print(f"Output: {output.name}")
-    n = extract_kenya_from_parent(parent, output)
-    print(f"Wrote {n} Kenya rows.")
+# ---------------------------------------------------------------------------
+# Analysis — print exploration report
+# ---------------------------------------------------------------------------
 
-
-# ── Main analysis ─────────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 80)
-    print("V-DEM KENYA DATA EXPLORATION")
-    print("=" * 80)
-
-    # 1. Inventory
-    kenya_files = discover_kenya_csvs()
-    parent_files = discover_parent_csvs()
-
-    print("\n── Kenya-specific CSVs ─────────────────────────────────────────")
-    print(f"{'File':<40s} {'Series':<10s} {'Ver':<6s} {'Cols':>5s} {'Rows':>5s} {'Years':>12s}")
-    print("-" * 80)
+def report_inventory(
+    kenya_files: list[dict[str, Any]],
+    parent_files: list[dict[str, Any]],
+) -> None:
+    """Print inventory of all discovered files."""
+    log.info("── Kenya-specific CSVs ─────────────────────────────────────────")
+    header = f"{'File':<40s} {'Series':<10s} {'Ver':<6s} {'Cols':>5s} {'Rows':>5s} {'Years':>12s}"
+    log.info(header)
+    log.info("-" * 80)
     for f in kenya_files:
         yr = f"{f['year_min']}-{f['year_max']}" if f["year_min"] else "N/A"
-        print(f"{f['file']:<40s} {f['series']:<10s} {f['version']:<6s} {f['num_cols']:>5d} {f['num_rows']:>5d} {yr:>12s}")
+        log.info(
+            "%s %s %s %5d %5d %12s",
+            f["file"].ljust(40), f["series"].ljust(10), f["version"].ljust(6),
+            f["num_cols"], f["num_rows"], yr,
+        )
 
-    print("\n── Parent CSVs (for automated derivation) ──────────────────────")
+    log.info("── Parent CSVs (for automated derivation) ──────────────────────")
     if parent_files:
         for p in parent_files:
             status = "EMPTY (0 bytes)" if p["empty"] else f"{p['size_bytes']:,} bytes"
-            print(f"  {p['file']:<40s} v{p['version']:<6s} {status}")
+            log.info("  %s v%-6s %s", p["file"].ljust(40), p["version"], status)
     else:
-        print("  None found.")
+        log.info("  None found.")
 
-    # 2. Series analysis
+
+def report_series(kenya_files: list[dict[str, Any]]) -> None:
+    """Analyze the two V-Dem release series."""
     ds_files = [f for f in kenya_files if f["series"] == "DS-CY"]
     core_files = [f for f in kenya_files if f["series"] == "CY-Core"]
 
-    print("\n── Two distinct V-Dem release series ───────────────────────────")
-    print(f"\n  DS-CY (Dataset, v5-v7.1): {len(ds_files)} files")
-    print(f"    Columns range: {min(f['num_cols'] for f in ds_files)}-{max(f['num_cols'] for f in ds_files)}")
-    print(f"    These are the older, larger dataset format with more variables.")
+    log.info("── Two distinct V-Dem release series ───────────────────────────")
 
-    print(f"\n  CY-Core (Country-Year Core, v8-v16): {len(core_files)} files")
-    print(f"    Columns range: {min(f['num_cols'] for f in core_files)}-{max(f['num_cols'] for f in core_files)}")
-    print(f"    The current standard release format. More focused variable set.")
+    if ds_files:
+        log.info(
+            "  DS-CY (Dataset, v5-v7.1): %d files, %d–%d columns",
+            len(ds_files),
+            min(f["num_cols"] for f in ds_files),
+            max(f["num_cols"] for f in ds_files),
+        )
+        log.info("    Older, larger dataset format with more variables.")
 
-    # 3. Column evolution
-    print("\n── Column evolution within CY-Core (v8 → v16) ─────────────────")
-    if len(core_files) >= 2:
-        first = min(core_files, key=lambda x: float(x["version"]))
-        last = max(core_files, key=lambda x: float(x["version"]))
-        common = first["columns"] & last["columns"]
-        only_first = first["columns"] - last["columns"]
-        only_last = last["columns"] - first["columns"]
-        print(f"  v{first['version']} has {first['num_cols']} cols, v{last['version']} has {last['num_cols']} cols")
-        print(f"  Shared columns: {len(common)}")
-        print(f"  Removed in v{last['version']}: {len(only_first)} — {sorted(only_first)[:10]}")
-        print(f"  Added in v{last['version']}: {len(only_last)} — {sorted(only_last)[:10]}...")
+    if core_files:
+        log.info(
+            "  CY-Core (Country-Year Core, v8-v16): %d files, %d–%d columns",
+            len(core_files),
+            min(f["num_cols"] for f in core_files),
+            max(f["num_cols"] for f in core_files),
+        )
+        log.info("    Current standard release format. More focused variable set.")
 
-    # 4. Year coverage
-    print("\n── Year coverage growth ────────────────────────────────────────")
+
+def report_column_evolution(kenya_files: list[dict[str, Any]]) -> None:
+    """Compare columns between earliest and latest CY-Core versions."""
+    core_files = [f for f in kenya_files if f["series"] == "CY-Core"]
+    if len(core_files) < 2:
+        return
+
+    log.info("── Column evolution within CY-Core ─────────────────────────────")
+    first = min(core_files, key=lambda x: float(x["version"]))
+    last = max(core_files, key=lambda x: float(x["version"]))
+    common = first["columns"] & last["columns"]
+    only_first = first["columns"] - last["columns"]
+    only_last = last["columns"] - first["columns"]
+
+    log.info(
+        "  v%s → v%s:  %d cols → %d cols",
+        first["version"], last["version"], first["num_cols"], last["num_cols"],
+    )
+    log.info("  Shared: %d  |  Removed: %d  |  Added: %d", len(common), len(only_first), len(only_last))
+
+    if only_first:
+        log.info("  Removed (sample): %s", sorted(only_first)[:10])
+    if only_last:
+        log.info("  Added (sample):   %s", sorted(only_last)[:10])
+
+
+def report_year_coverage(kenya_files: list[dict[str, Any]]) -> None:
+    """Print year ranges for each version."""
+    log.info("── Year coverage growth ────────────────────────────────────────")
     for f in sorted(kenya_files, key=lambda x: (x["series"], x["version"])):
         yr = f"{f['year_min']}-{f['year_max']}" if f["year_min"] else "N/A"
-        print(f"  v{f['version']:<6s} ({f['series']:<8s}): {yr}  ({f['num_years']} data-years)")
+        log.info(
+            "  v%-6s (%s): %s  (%d data-years)",
+            f["version"], f["series"], yr, f["num_years"],
+        )
 
-    # 5. ETL indicator availability
-    print("\n── ETL indicator availability (from V-DEM.py) ──────────────────")
-    for ind in ETL_INDICATORS:
+
+def report_etl_indicators(kenya_files: list[dict[str, Any]]) -> None:
+    """Check availability of the 13 ETL indicators across all versions."""
+    log.info("── ETL indicator availability (from V-DEM.py) ──────────────────")
+    for ind in _ETL_SOURCE_COLS:
         present_in = [f["version"] for f in kenya_files if ind in f["columns"]]
-        absent_in = [f["version"] for f in kenya_files if ind not in f["columns"]]
-        status = "ALL" if not absent_in else f"v{', v'.join(present_in)}"
-        note = ETL_INDICATOR_NOTES.get(ind, "")
-        mark = "OK" if not absent_in else "PARTIAL" if present_in else "MISSING"
-        print(f"  [{mark:>7s}] {ind:<25s} — {status}")
+        absent_in  = [f["version"] for f in kenya_files if ind not in f["columns"]]
+
+        if not absent_in:
+            mark = "     OK"
+            status = "ALL"
+        elif present_in:
+            mark = "PARTIAL"
+            status = "v" + ", v".join(present_in)
+        else:
+            mark = "MISSING"
+            status = "NONE"
+
+        log.info("  [%s] %-25s — %s", mark, ind, status)
+
+        note = ETL_INDICATOR_NOTES.get(ind)
         if note:
-            print(f"           NOTE: {note}")
+            log.info("           NOTE: %s", note)
 
-    # 6. Derivation method
-    print("\n── How Kenya CSVs are derived ──────────────────────────────────")
-    print("""
-  Each Kenya CSV is a simple row filter of its parent V-Dem release:
-    1. Load the full V-Dem CSV (all countries, all years)
-    2. Filter: country_text_id == 'KEN'
-    3. Keep ALL columns unchanged
-    4. Write to "{original_name} Kenya.csv"
 
-  The parent CSV for v10 (V-Dem-CY-Core-v10.csv) is present but empty (0 bytes).
-  To populate it, download the full V-Dem v10 dataset from https://v-dem.net/
+def report_derivation_method() -> None:
+    """Explain how Kenya CSVs are derived."""
+    log.info("── How Kenya CSVs are derived ──────────────────────────────────")
+    log.info("  Each Kenya CSV is a simple row filter of its parent V-Dem release:")
+    log.info("    1. Load the full V-Dem CSV (all countries, all years)")
+    log.info("    2. Filter: country_text_id == '%s'", KENYA_VDEM_ID)
+    log.info("    3. Keep ALL columns unchanged")
+    log.info("    4. Write to '{original_name} Kenya.csv'")
+    log.info("")
+    log.info("  Automated derivation command:")
+    log.info("    python3 explore_vdem_data.py --derive <parent_csv_path>")
 
-  Automated derivation command:
-    python3 explore_vdem_data.py --derive V-Dem-CY-Core-v10.csv
-    """)
 
-    # 7. Key differences between series
-    print("── Key differences: DS-CY vs CY-Core ──────────────────────────")
-    print("""
-  DS-CY (v5-v7.1):
-  - Larger variable set (2097-3153 columns)
-  - Includes "thick" variants of some indices (e.g. v2x_freexp_thick)
-  - Uses simpler metadata columns (codingstart/gapstart/gapend/codingend)
-  - Column order: country_name, country_id, country_text_id, year, ...
-  - v2x_freexp_altinf NOT available (use v2x_freexp or v2x_freexp_thick)
+def report_series_differences() -> None:
+    """Summarise key differences between DS-CY and CY-Core."""
+    log.info("── Key differences: DS-CY vs CY-Core ──────────────────────────")
+    log.info("  DS-CY (v5-v7.1):")
+    log.info("    - Larger variable set (2097-3153 columns)")
+    log.info("    - Includes 'thick' variants (e.g. v2x_freexp_thick)")
+    log.info("    - Simpler metadata (codingstart/gapstart/gapend/codingend)")
+    log.info("    - v2x_freexp_altinf NOT available (use v2x_freexp instead)")
+    log.info("")
+    log.info("  CY-Core (v8-v16):")
+    log.info("    - Focused variable set (1730-1908 columns)")
+    log.info("    - Richer metadata (historical_date, project, gap_index)")
+    log.info("    - v2x_freexp_altinf IS available")
+    log.info("    - Stable ~1818 cols v10-v15, expanded to 1908 in v16")
+    log.info("")
+    log.info("  Both series:")
+    log.info("    - Filter by country_text_id = '%s'", KENYA_VDEM_ID)
+    log.info("    - 12/13 ETL indicators present (v2x_legcon should be v2xlg_legcon)")
+    log.info("    - Year coverage starts at 1900, grows ~1 year per release")
 
-  CY-Core (v8-v16):
-  - More focused variable set (1730-1908 columns)
-  - Richer metadata (historical_date, project, histname, gap_index in v16)
-  - Column order: country_name, country_text_id, country_id, year, ...
-  - v2x_freexp_altinf IS available
-  - Stable ~1818 cols from v10-v15, expanded to 1908 in v16
 
-  Both series:
-  - Filter by country_text_id = 'KEN'
-  - All 13 ETL indicators present EXCEPT v2x_legcon (should be v2xlg_legcon)
-  - Year coverage starts at 1900, grows by ~1 year per release
-    """)
+def report_recommendations() -> None:
+    """Print actionable recommendations for the ETL pipeline."""
+    log.info("── Recommendations for V-DEM.py ETL ────────────────────────────")
+    log.info("  1. FIX: Change 'v2x_legcon' → 'v2xlg_legcon' in VDEM_INDICATORS")
+    log.info("     (currently always NULL due to column name mismatch)")
+    log.info("")
+    log.info("  2. CONSIDER: For DS-CY (v5-v7.1), map 'v2x_freexp' or")
+    log.info("     'v2x_freexp_thick' → freedom_expression (v2x_freexp_altinf missing)")
+    log.info("")
+    log.info("  3. ADD: Use --derive flag to auto-generate Kenya CSVs from parent files")
+    log.info("")
+    log.info("  4. NOTE: V-Dem-CY-Core-v10.csv is empty (0 bytes) — needs real data")
 
-    # 8. Recommendations
-    print("── Recommendations for V-DEM.py ETL ────────────────────────────")
-    print("""
-  1. FIX: Change 'v2x_legcon' to 'v2xlg_legcon' in VDEM_INDICATORS
-     (currently always NULL due to column name mismatch)
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
-  2. CONSIDER: For DS-CY (v5-v7.1), map 'v2x_freexp' or 'v2x_freexp_thick'
-     to the freedom_expression field, since v2x_freexp_altinf doesn't exist
+def run_analysis() -> None:
+    """Full exploration analysis — mirrors V-DEM.py's main() flow."""
+    log.info("=" * 80)
+    log.info("V-DEM KENYA DATA EXPLORATION")
+    log.info("=" * 80)
 
-  3. ADD: An extract_kenya_csv() utility (included in this script) to
-     auto-derive Kenya CSVs from any new parent V-Dem release
+    # Extract — discover files
+    kenya_files = discover_kenya_csvs(BASE_DIR)
+    parent_files = discover_parent_csvs(BASE_DIR)
 
-  4. NOTE: The parent V-Dem-CY-Core-v10.csv is empty (0 bytes). Either
-     populate it with the real data or remove it to avoid confusion.
-    """)
+    if not kenya_files:
+        log.error("No Kenya CSV files found in %s.", BASE_DIR)
+        sys.exit(1)
+
+    # Transform — analyse
+    report_inventory(kenya_files, parent_files)
+    report_series(kenya_files)
+    report_column_evolution(kenya_files)
+    report_year_coverage(kenya_files)
+    report_etl_indicators(kenya_files)
+
+    # Load — output findings
+    report_derivation_method()
+    report_series_differences()
+    report_recommendations()
+
+    log.info("=" * 80)
+    log.info(
+        "Exploration complete — %d Kenya files, %d parent files analysed.",
+        len(kenya_files), len(parent_files),
+    )
+
+
+def run_derive(parent_path: str) -> None:
+    """Derive a Kenya CSV from a parent V-Dem file — mirrors V-DEM.py's ETL."""
+    parent = Path(parent_path)
+    if not parent.is_absolute():
+        parent = BASE_DIR / parent
+
+    version = _extract_version(parent.name)
+    stem = parent.stem
+    output = parent.parent / f"{stem} Kenya.csv"
+
+    log.info(
+        "Kenya derive — V-Dem v%s  country=%s  file=%s",
+        version, KENYA_VDEM_ID, parent,
+    )
+
+    n = extract_kenya_from_parent(parent, output)
+
+    log.info("Kenya derive complete — %d rows written to %s.", n, output.name)
+
+
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--derive":
+        if len(sys.argv) < 3:
+            log.error("Usage: python3 explore_vdem_data.py --derive <parent_csv>")
+            sys.exit(1)
+        run_derive(sys.argv[2])
+    else:
+        run_analysis()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--derive":
-        if len(sys.argv) < 3:
-            print("Usage: python3 explore_vdem_data.py --derive <parent_csv>")
-            sys.exit(1)
-        auto_derive_kenya_csv(sys.argv[2])
-    else:
-        main()
+    main()
